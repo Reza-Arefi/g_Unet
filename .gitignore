@@ -1,0 +1,14 @@
+# Ignore everything
+*
+
+# But keep directories so Git can traverse them
+!*/
+
+# Keep Python files
+!*.py
+
+# Keep Jupyter notebooks
+!*.ipynb
+
+# Keep this file
+!.gitignore
