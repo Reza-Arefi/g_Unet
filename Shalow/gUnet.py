@@ -324,7 +324,8 @@ class Unet2D(nn.Module):
     def forward(self, x, time, x_self_cond = None, use_grid=True):
 
         x = (x - self.Par['inp_shift'])/self.Par['inp_scale']
-        x = x.reshape(-1, self.Par["lb"]*self.Par["nf"], self.Par["nx"], self.Par["ny"])
+        nf_in = self.Par.get("nf_in", self.Par["nf"])
+        x = x.reshape(-1, self.Par["lb"] * nf_in, self.Par["nx"], self.Par["ny"])
         time = (time - self.Par['t_shift'])/self.Par['t_scale']
 
         x = self.init_conv(x)

@@ -33,9 +33,12 @@ def import_unet2d(generator: str = "gUnet"):
 def build_model(crop_h: int, crop_w: int, config: TrainConfig):
     generator = getattr(config, "generator", "gUnet")
     Unet2D = import_unet2d(generator)
+    iD_in = config.resolved_input_channels()
+    oD = config.iD
     par = {
         "lb": 3,
-        "nf": config.iD,
+        "nf": oD,
+        "nf_in": iD_in,
         "nx": crop_h,
         "ny": crop_w,
         "inp_shift": 0.0,
@@ -49,7 +52,7 @@ def build_model(crop_h: int, crop_w: int, config: TrainConfig):
         dim=config.unet_dim,
         Par=par,
         dim_mults=config.unet_dim_mults,
-        channels=par["lb"] * par["nf"],
+        channels=par["lb"] * iD_in,
         **(
             {"dropout": float(getattr(config, "unet_dropout", 0.0))}
             if generator == "gUnet"

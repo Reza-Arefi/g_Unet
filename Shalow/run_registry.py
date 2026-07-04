@@ -12,6 +12,7 @@ import numpy as np
 from window_paths import (
     export_manifest_path,
     pool_prefix,
+    resolve_export_component,
     split_manifest_path,
     test_prefix,
     train_prefix,
@@ -102,6 +103,38 @@ def test_rollout_dir(
 ) -> Path:
     """Notebook 05 rollout outputs: Shalow/Test&Rollout/{run_name}/."""
     return Path(shallow_dir) / TEST_ROLLOUT_DIR_NAME / run_name(export_key, dt=dt, run_tag=run_tag)
+
+
+def finetune_run_name(
+    export_key: str,
+    window_number: int,
+    *,
+    dt: int = DEFAULT_DT,
+    run_tag: str = RUN_TAG,
+    loss_tag: str = "l1random",
+) -> str:
+    """Run name for single-catalog-window fine-tuning (window_number is 1..12)."""
+    w = int(window_number)
+    if w < 1 or w > 12:
+        raise ValueError(f"window_number must be 1..12, got {w}")
+    tag = f"{run_tag}_{loss_tag}_finetune_w{w:02d}"
+    return run_name(export_key, dt=dt, run_tag=tag)
+
+
+def finetune_rollout_eval_name(model_run_name: str, window_number: int) -> str:
+    """Rollout folder tag for fine-tuned single-window eval."""
+    w = int(window_number)
+    return f"{model_run_name}__on__window_{w:02d}"
+
+
+def test_rollout_dir_finetune(
+    shallow_dir: Path | str,
+    model_run_name: str,
+    window_number: int,
+) -> Path:
+    return Path(shallow_dir) / "fineTuning" / "Test&Rollout" / finetune_rollout_eval_name(
+        model_run_name, window_number
+    )
 
 
 def rollout_eval_name(model_run_name: str, export_key: str) -> str:
@@ -234,18 +267,21 @@ def collect_dataset_stats(
     export_key: str,
     *,
     dt: int = DEFAULT_DT,
+    component: str | None = None,
 ) -> dict[str, Any]:
     data_dir = Path(data_dir)
-    pool_p = pool_prefix(data_dir, export_key, dt=dt)
-    train_p = train_prefix(data_dir, export_key, dt=dt)
-    val_p = val_prefix(data_dir, export_key, dt=dt)
-    test_p = test_prefix(data_dir, export_key, dt=dt)
+    component = resolve_export_component(data_dir, export_key, dt=dt, component=component)
+    pool_p = pool_prefix(data_dir, export_key, component=component, dt=dt)
+    train_p = train_prefix(data_dir, export_key, component=component, dt=dt)
+    val_p = val_prefix(data_dir, export_key, component=component, dt=dt)
+    test_p = test_prefix(data_dir, export_key, component=component, dt=dt)
     split_path = split_manifest_path(data_dir, export_key)
     export_path = export_manifest_path(data_dir, export_key)
     pool_mode = Path(f"{pool_p}_sims.npy").exists()
 
     stats: dict[str, Any] = {
         "export_key": export_key,
+        "export_component": component,
         "dt_hours": dt,
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "data_dir": str(data_dir / export_key),

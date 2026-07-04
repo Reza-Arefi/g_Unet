@@ -361,8 +361,183 @@ def _plot_series_panel(
     ax.set_xlabel("epoch")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    ax.legend(loc="upper right", fontsize=8)
+    handles, labels = ax.get_legend_handles_labels()
+    if labels:
+        ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
+
+
+def _extract_window_pool_val_series(
+    hist: dict[str, Any],
+    *,
+    n_windows: int,
+    metric: str = "l1",
+) -> dict[str, list[float]] | None:
+    """Build per-epoch val series for each catalog window plus overall mean."""
+    records = hist.get("val_window_rmse") or []
+    if not records or not any(records):
+        return None
+
+    suffix = "" if metric == "rmse" else "_l1"
+    overall_key = "overall_rmse" if metric == "rmse" else "overall_l1"
+    series: dict[str, list[float]] = {"overall (mean)": []}
+    for i in range(n_windows):
+        series[f"slot_{i}"] = []
+
+    for rec in records:
+        if not rec:
+            for key in series:
+                series[key].append(float("nan"))
+            continue
+        series["overall (mean)"].append(float(rec.get(overall_key, float("nan"))))
+        for i in range(n_windows):
+            key = f"window_{i:02d}{suffix}"
+            series[f"slot_{i}"].append(float(rec.get(key, float("nan"))))
+    return series
+
+
+def _extract_window_pool_skill_series(
+    hist: dict[str, Any],
+    *,
+    n_windows: int,
+) -> dict[str, list[float]] | None:
+    """Build per-epoch speed-skill series for each catalog window plus overall mean."""
+    records = hist.get("val_window_rmse") or []
+    if not records or not any(records):
+        return None
+
+    series: dict[str, list[float]] = {"overall (mean)": []}
+    for i in range(n_windows):
+        series[f"slot_{i}"] = []
+
+    has_skill = False
+    for rec in records:
+        if not rec:
+            for key in series:
+                series[key].append(float("nan"))
+            continue
+        overall = float(rec.get("overall_skill", float("nan")))
+        series["overall (mean)"].append(overall)
+        if np.isfinite(overall):
+            has_skill = True
+        for i in range(n_windows):
+            val = float(rec.get(f"window_{i:02d}_skill", float("nan")))
+            series[f"slot_{i}"].append(val)
+            if np.isfinite(val):
+                has_skill = True
+    return series if has_skill else None
+
+
+def _catalog_window_plot_styles(n_windows: int) -> tuple[list, list]:
+    """Distinct colors and line styles for up to 12 catalog windows."""
+    import matplotlib.cm as cm
+
+    cmap = cm.get_cmap("tab10", max(n_windows, 10))
+    colors = [cmap(i % 10) for i in range(n_windows)]
+    base_styles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 2, 1, 2))]
+    linestyles = [base_styles[i % len(base_styles)] for i in range(n_windows)]
+    return colors, linestyles
+
+
+def _plot_window_pool_val_curves(
+    ax,
+    epochs: list[int],
+    series: dict[str, list[float]],
+    *,
+    title: str,
+    ylabel: str,
+    n_windows: int | None = None,
+    reference_y: float | None = None,
+) -> None:
+    try:
+        from Magic_window.window_catalog import catalog_window_number, catalog_window_label
+    except ImportError:
+        catalog_window_number = lambda i: str(i + 1)  # noqa: E731
+        catalog_window_label = lambda i: str(i + 1)  # noqa: E731
+
+    slot_keys = sorted(
+        (k for k in series if k.startswith("slot_")),
+        key=lambda k: int(k.split("_", 1)[1]),
+    )
+    n_windows = n_windows or len(slot_keys)
+    colors, linestyles = _catalog_window_plot_styles(n_windows)
+
+    for win_i, slot_key in enumerate(slot_keys):
+        values = series.get(slot_key) or []
+        if not values:
+            continue
+        slot = int(slot_key.split("_", 1)[1])
+        ax.plot(
+            epochs,
+            values,
+            color=colors[win_i % len(colors)],
+            linestyle=linestyles[win_i % len(linestyles)],
+            linewidth=1.6,
+            alpha=0.92,
+            label=catalog_window_label(slot),
+            zorder=2,
+        )
+        # Number label at the latest epoch, slightly above the line end.
+        last_x = epochs[-1]
+        last_y = float(values[-1])
+        if np.isfinite(last_y):
+            ax.annotate(
+                catalog_window_number(slot),
+                xy=(last_x, last_y),
+                xytext=(6, 5),
+                textcoords="offset points",
+                fontsize=9,
+                fontweight="bold",
+                color=colors[win_i % len(colors)],
+                ha="left",
+                va="bottom",
+                clip_on=False,
+                zorder=5,
+            )
+
+    overall = series.get("overall (mean)")
+    if overall:
+        ax.plot(
+            epochs,
+            overall,
+            color="black",
+            linewidth=2.8,
+            linestyle="-",
+            label="overall (mean)",
+            zorder=10,
+        )
+        last_y = float(overall[-1])
+        if np.isfinite(last_y):
+            ax.annotate(
+                "μ",
+                xy=(epochs[-1], last_y),
+                xytext=(6, 5),
+                textcoords="offset points",
+                fontsize=11,
+                fontweight="bold",
+                color="black",
+                ha="left",
+                va="bottom",
+                clip_on=False,
+                zorder=11,
+            )
+
+    ax.set_xlabel("epoch")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    if reference_y is not None:
+        ax.axhline(reference_y, color="#888888", linestyle="--", linewidth=1.0, alpha=0.55, zorder=1)
+    # Margin for end-of-line number labels.
+    if epochs:
+        ax.margins(x=0.08)
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        fontsize=7,
+        framealpha=0.92,
+        borderaxespad=0.0,
+    )
 
 
 def save_fix_window_sample_figure(
@@ -456,6 +631,15 @@ def save_fix_window_sample_figure(
     return out_path
 
 
+def _unpack_xy_mask_day_hour(sample: tuple) -> tuple:
+    """Accept 5-tuple or window-pool 6-tuple (…, window_slot)."""
+    if len(sample) == 5:
+        return sample
+    if len(sample) == 6:
+        return sample[:5]
+    raise ValueError(f"Expected dataset sample of length 5 or 6, got {len(sample)}")
+
+
 def save_validation_mask_preview(
     val_dataset,
     output_path: Path | str,
@@ -497,7 +681,7 @@ def save_validation_mask_preview(
     cmap_field.set_bad(color="#d5d5d5")
 
     for row, ds_idx in enumerate(sample_indices):
-        _x, y, m, _d, _h = val_dataset[ds_idx]
+        _x, y, m, _d, _h = _unpack_xy_mask_day_hour(val_dataset[ds_idx])
         mask_np = m.detach().cpu().numpy().astype(np.float32)
         loss_mask_np = mask_np.copy()
         if loss_mask_buffer_px > 0:
@@ -985,6 +1169,7 @@ def save_gaussian_circles_validation_figures(
     out_dir: Path | str,
     *,
     iD: int = 3,
+    iD_in: int | None = None,
     epoch: int | None = None,
     n_samples: int = 4,
     seed: int = 42,
@@ -1035,6 +1220,7 @@ def save_gaussian_circles_validation_figures(
     model.eval()
     paths: list[Path] = []
     radii = circle_radii if circle_radii is not None else DEFAULT_GAUSS_CIRCLE_RADII
+    in_ch = iD if iD_in is None else iD_in
 
     with torch.no_grad():
         for sample_idx, ds_idx in enumerate(indices):
@@ -1042,7 +1228,7 @@ def save_gaussian_circles_validation_figures(
             x_b = x.unsqueeze(0).to(device)
             d_b = d.unsqueeze(0).to(device)
             h_b = h.unsqueeze(0).to(device)
-            pred = model(x_b[:, -3 * iD :], d_b + h_b / 365.0)[0, :iD].cpu()
+            pred = model(x_b[:, -3 * in_ch :], d_b + h_b / 365.0)[0, :iD].cpu()
             target = y[:iD]
             mask = m
 
@@ -1154,6 +1340,7 @@ def compute_viz_sample_circle_l1(
     iD: int,
     inner_circle_radii: tuple[float, ...],
     *,
+    iD_in: int | None = None,
     channel_names: tuple[str, ...] = ("u", "v"),
 ) -> dict[float, dict[str, float]]:
     """Mean circle L1 per channel on fixed viz val samples (cols 4–5 metrics)."""
@@ -1171,7 +1358,7 @@ def compute_viz_sample_circle_l1(
     with torch.no_grad():
         for ds_idx in sample_indices:
             pred, target, mask = forward_fix_window_sample(
-                model, dataset, ds_idx, device, iD=iD,
+                model, dataset, ds_idx, device, iD=iD, iD_in=iD_in,
             )
             if iD >= 2:
                 pred_plot, plot_ch = _uv_with_speed(pred)
@@ -1338,6 +1525,7 @@ def backfill_circle_l1_in_hist(
     inner_circle_radii: tuple[float, ...],
     checkpoint_dir: Path | str,
     *,
+    iD_in: int | None = None,
     device: torch.device | str = "cpu",
 ) -> dict[str, Any]:
     """
@@ -1372,6 +1560,7 @@ def backfill_circle_l1_in_hist(
             viz_indices,
             iD,
             tuple(inner_circle_radii),
+            iD_in=iD_in,
         )
         for radius, ch_metrics in metrics.items():
             for ch, val in ch_metrics.items():
@@ -1583,15 +1772,17 @@ def forward_fix_window_sample(
     device: torch.device | str,
     *,
     iD: int = 2,
+    iD_in: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run +1d increment forward pass for one validation sample."""
+    in_ch = iD if iD_in is None else iD_in
     model.eval()
     x, y, m, d, h = dataset[ds_idx]
     with torch.no_grad():
         x_b = x.unsqueeze(0).to(device)
         d_b = d.unsqueeze(0).to(device)
         h_b = h.unsqueeze(0).to(device)
-        pred = model(x_b[:, -3 * iD :], d_b + h_b / 365.0)[0, :iD].cpu()
+        pred = model(x_b[:, -3 * in_ch :], d_b + h_b / 365.0)[0, :iD].cpu()
     return pred, y[:iD], m
 
 
@@ -1638,6 +1829,7 @@ def save_fix_window_validation_figures(
     out_dir: Path | str,
     *,
     iD: int = 3,
+    iD_in: int | None = None,
     epoch: int | None = None,
     n_samples: int = 4,
     seed: int = 42,
@@ -1690,6 +1882,7 @@ def save_fix_window_validation_figures(
     was_training = model.training
     model.eval()
     paths: list[Path] = []
+    in_ch = iD if iD_in is None else iD_in
 
     with torch.no_grad():
         for sample_idx, ds_idx in enumerate(indices):
@@ -1697,7 +1890,7 @@ def save_fix_window_validation_figures(
             x_b = x.unsqueeze(0).to(device)
             d_b = d.unsqueeze(0).to(device)
             h_b = h.unsqueeze(0).to(device)
-            pred = model(x_b[:, -3 * iD :], d_b + h_b / 365.0)[0, :iD].cpu()
+            pred = model(x_b[:, -3 * in_ch :], d_b + h_b / 365.0)[0, :iD].cpu()
             target = y[:iD]
             mask = m
 
@@ -1788,12 +1981,13 @@ def save_adv_no_training_curves(
     loss_metric: str = "components",
     val_reconstruction_metric: str = "l1",
     perceptual_label: str = "VGG-19",
+    n_windows: int = 0,
     dpi: int = 140,
 ) -> list[Path]:
     """
     Save/update loss curve PNGs under ``out_dir/curves/``.
 
-    Files: overview, l1, total, perceptual, adversarial, lr.
+    Files: overview, l1, val-per-window (if n_windows>0), total, perceptual, adversarial, lr.
     """
     import matplotlib
 
@@ -1841,6 +2035,40 @@ def save_adv_no_training_curves(
         adversarial_warmup_epochs=warmup_epochs,
     )
     _save(fig, "loss_l1.png")
+
+    # --- Per-window validation (catalog pool: 12 windows + overall mean) ---
+    if n_windows > 0:
+        win_metric = "rmse" if val_reconstruction_metric == "rmse" else "l1"
+        win_series = _extract_window_pool_val_series(
+            hist, n_windows=n_windows, metric=win_metric
+        )
+        if win_series:
+            fig, ax = plt.subplots(figsize=(12.5, 6.0))
+            _plot_window_pool_val_curves(
+                ax,
+                epochs,
+                win_series,
+                title=f"Validation {val_recon_label} per catalog window (1–12)",
+                ylabel=val_recon_label,
+                n_windows=n_windows,
+            )
+            fig.subplots_adjust(right=0.78)
+            _save(fig, "loss_val_per_window.png")
+
+        skill_series = _extract_window_pool_skill_series(hist, n_windows=n_windows)
+        if skill_series:
+            fig, ax = plt.subplots(figsize=(12.5, 6.0))
+            _plot_window_pool_val_curves(
+                ax,
+                epochs,
+                skill_series,
+                title="Validation speed skill per catalog window (1–12)",
+                ylabel="skill (1 − model/persist speed RMSE)",
+                n_windows=n_windows,
+                reference_y=0.0,
+            )
+            fig.subplots_adjust(right=0.78)
+            _save(fig, "skill_val_per_window.png")
 
     # --- Total generator loss ---
     fig, ax = plt.subplots(figsize=(7, 4))

@@ -177,6 +177,24 @@ def masked_speed_rmse(
     return torch.sqrt(mse.clamp_min(1e-8))
 
 
+def speed_skill_from_uv_fields(
+    anchor_uv: torch.Tensor,
+    target_uv: torch.Tensor,
+    model_uv: torch.Tensor,
+    mask: torch.Tensor,
+    spatial_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Skill = 1 − model_speed_RMSE / persistence_speed_RMSE.
+
+    Persistence holds anchor |U,V| fixed to the forecast horizon (rollout convention).
+    """
+    persist_rmse = masked_speed_rmse(anchor_uv, target_uv, mask, spatial_weight)
+    model_rmse = masked_speed_rmse(model_uv, target_uv, mask, spatial_weight)
+    skill = 1.0 - model_rmse / persist_rmse.clamp_min(1e-8)
+    return skill, persist_rmse, model_rmse
+
+
 def reconstruction_loss(
     pred,
     target,

@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gUnet import Unet2D
+from src.train.channel_select import resolve_channel_indices, resolve_target_channel_indices
 from src.train.losses import masked_loss, my_loss as myLoss
 
 
@@ -37,6 +38,8 @@ class TrainConfig:
     weight_decay: float = 0.0  # L2 penalty (e.g. 1e-4); use with AdamW for decoupled decay
     optimizer: str = "adam"  # "adam" | "adamw"
     iD: int = 3
+    channel_indices: tuple[int, ...] | None = None  # export indices for model input
+    target_channel_indices: tuple[int, ...] | None = None  # export indices to predict; None = same as input
     device: str = "cuda:7"
     checkpoint_dir: str = "Models/fix_window"
     run_name: str = "fix_window_10_19_dt96"
@@ -52,6 +55,8 @@ class TrainConfig:
     max_mask_frac: float = 0.05  # reject crops with masked fraction >= this (dynamic mode)
     max_crop_attempts: int = 200
     train_crops_per_anchor: int | None = None  # e.g. 1 = first crop only; 2 = all K export crops
+    slots_per_epoch: int | None = None  # window pool: pick N of 12 catalog slots each epoch
+    fixed_window_slot: int | None = None  # window pool: train/val on one catalog slot only (0..11)
     preview_val_mask: bool = True  # save val_mask_preview.png before epoch 1
     unet_dim: int = 32
     unet_dim_mults: tuple[int, ...] = (1, 2, 4, 8)
@@ -73,7 +78,23 @@ class TrainConfig:
         values = {k: v for k, v in data.items() if k in allowed}
         if "unet_dim_mults" in values and isinstance(values["unet_dim_mults"], list):
             values["unet_dim_mults"] = tuple(values["unet_dim_mults"])
+        if "channel_indices" in values and values["channel_indices"] is not None:
+            values["channel_indices"] = tuple(int(i) for i in values["channel_indices"])
+        if "target_channel_indices" in values and values["target_channel_indices"] is not None:
+            values["target_channel_indices"] = tuple(int(i) for i in values["target_channel_indices"])
         return cls(**values)
+
+    def resolved_channel_indices(self) -> tuple[int, ...]:
+        return resolve_channel_indices(self.iD, self.channel_indices)
+
+    def resolved_target_channel_indices(self) -> tuple[int, ...]:
+        ch_in = self.resolved_channel_indices()
+        return resolve_target_channel_indices(ch_in, self.target_channel_indices)
+
+    def resolved_input_channels(self) -> int:
+        if self.channel_indices is not None:
+            return len(self.resolved_channel_indices())
+        return int(self.iD)
 
 
 def split_train_val_indices(
@@ -142,10 +163,12 @@ def _index_tensors(
 def _global_channel_stats(
     data: torch.Tensor,
     frame_indices: list[int],
-    iD: int,
+    iD: int | None = None,
+    channel_indices: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Guiana-style per-channel mean/std over all spatial pixels (mask not used in norm)."""
-    frames = [data[:, t, :iD].float() for t in frame_indices]
+    ch = resolve_channel_indices(iD, channel_indices)
+    frames = [data[:, t, ch, :, :].float() for t in frame_indices]
     mean = sum(f.mean(dim=(0, 2, 3), keepdim=True) for f in frames) / float(len(frames))
     std = torch.cat(frames, dim=0).std(dim=(0, 2, 3), keepdim=True).clamp_min(1e-8)
     return mean, std
@@ -162,41 +185,48 @@ class SimulationDataset(Dataset):
         hour: torch.Tensor,
         mean=None,
         std=None,
+        mean_x=None,
+        std_x=None,
         iD: int = 3,
+        channel_indices: tuple[int, ...] | None = None,
+        target_channel_indices: tuple[int, ...] | None = None,
     ):
-        self.iD = iD
+        ch_in = resolve_channel_indices(iD, channel_indices)
+        ch_out = resolve_target_channel_indices(ch_in, target_channel_indices)
+        self.channel_indices = ch_in
+        self.target_channel_indices = ch_out
+        self.iD = len(ch_out)
+        self.iD_in = len(ch_in)
         n_frames = int(data.shape[1])
 
         if n_frames <= 4:
-            # Compact export: 3 conditioning + 1 forecast (e.g. sample_13_22_*_dt360)
             cond_idx = list(range(n_frames - 1))
             anchor_idx = n_frames - 2
             forecast_idx = n_frames - 1
             self.x = torch.cat(
-                [data[:, t, :iD, :, :] for t in cond_idx],
+                [data[:, t, ch_in, :, :] for t in cond_idx],
                 dim=1,
             ).float()
             self.y = (
-                data[:, forecast_idx, :iD, :, :] - data[:, anchor_idx, :iD, :, :]
+                data[:, forecast_idx, ch_out, :, :] - data[:, anchor_idx, ch_out, :, :]
             ).float()
             n_x_frames = len(cond_idx)
             n_y_steps = 1
         else:
-            # Legacy long export: 4 frames in x (model uses last 3), 3 increment targets
             self.x = torch.cat(
                 [
-                    data[:, 0, :iD, :, :],
-                    data[:, 1, :iD, :, :],
-                    data[:, 2, :iD, :, :],
-                    data[:, 3, :iD, :, :],
+                    data[:, 0, ch_in, :, :],
+                    data[:, 1, ch_in, :, :],
+                    data[:, 2, ch_in, :, :],
+                    data[:, 3, ch_in, :, :],
                 ],
                 dim=1,
             ).float()
             self.y = torch.cat(
                 [
-                    (data[:, 4, :iD, :, :] - data[:, 3, :iD, :, :]),
-                    (data[:, 5, :iD, :, :] - data[:, 4, :iD, :, :]),
-                    (data[:, 6, :iD, :, :] - data[:, 5, :iD, :, :]),
+                    (data[:, 4, ch_out, :, :] - data[:, 3, ch_out, :, :]),
+                    (data[:, 5, ch_out, :, :] - data[:, 4, ch_out, :, :]),
+                    (data[:, 6, ch_out, :, :] - data[:, 5, ch_out, :, :]),
                 ],
                 dim=1,
             ).float()
@@ -211,17 +241,24 @@ class SimulationDataset(Dataset):
             stat_frames = [0, 1, 2, 3]
 
         if mean is None:
-            self.mean, self.std = _global_channel_stats(data, stat_frames, iD)
+            mean_x, std_x = _global_channel_stats(data, stat_frames, channel_indices=ch_in)
+            mean_y, std_y = _global_channel_stats(data, stat_frames, channel_indices=ch_out)
         else:
-            self.mean = mean
-            self.std = std
+            mean_y, std_y = mean, std
+            mean_x = mean_x if mean_x is not None else mean_y
+            std_x = std_x if std_x is not None else std_y
 
-        mean_x = self.mean.repeat(1, n_x_frames, 1, 1)
-        std_x = self.std.repeat(1, n_x_frames, 1, 1)
-        std_y = self.std.repeat(1, n_y_steps, 1, 1)
+        mean_x_rep = mean_x.repeat(1, n_x_frames, 1, 1)
+        std_x_rep = std_x.repeat(1, n_x_frames, 1, 1)
+        std_y_rep = std_y.repeat(1, n_y_steps, 1, 1)
 
-        self.x = (self.x - mean_x) / (std_x + 1e-8)
-        self.y = self.y / (std_y + 1e-8)
+        self.x = (self.x - mean_x_rep) / (std_x_rep + 1e-8)
+        self.y = self.y / (std_y_rep + 1e-8)
+
+        self.mean_x = mean_x
+        self.std_x = std_x
+        self.mean = mean_y
+        self.std = std_y
 
         # Zero land (mask == 1); model sees zeros there, loss ignores them (Guiana pattern).
         ocean = (mask == 0).to(dtype=self.x.dtype).unsqueeze(1)
@@ -667,9 +704,25 @@ def train(
     train_size = len(train_data)
     val_size = len(val_data)
 
-    train_set = SimulationDataset(train_data, train_mask, train_day, train_hour, iD=config.iD)
+    train_set = SimulationDataset(
+        train_data,
+        train_mask,
+        train_day,
+        train_hour,
+        channel_indices=config.resolved_channel_indices(),
+        target_channel_indices=config.resolved_target_channel_indices(),
+    )
     val_set = SimulationDataset(
-        val_data, val_mask, val_day, val_hour, mean=train_set.mean, std=train_set.std, iD=config.iD
+        val_data,
+        val_mask,
+        val_day,
+        val_hour,
+        mean=train_set.mean,
+        std=train_set.std,
+        mean_x=train_set.mean_x,
+        std_x=train_set.std_x,
+        channel_indices=config.resolved_channel_indices(),
+        target_channel_indices=config.resolved_target_channel_indices(),
     )
 
     config_path, state_path, history_path, resume_path = _paths(config)

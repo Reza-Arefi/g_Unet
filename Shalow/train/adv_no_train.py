@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,9 +36,13 @@ from src.train.fix_window_train import (
 )
 from src.train.random_window_dataset import (
     RandomWindowZarrDataset,
+    WindowPoolCachedDataset,
+    WindowPoolEvalDataset,
+    evaluate_window_pool_metrics,
     filter_pool_dict,
     load_epoch_windows,
     load_random_window_pool,
+    load_window_pool,
     norm_stats_from_exported_sims,
     sort_pool_chronologically,
 )
@@ -107,6 +112,10 @@ class AdvNOTrainConfig(TrainConfig):
     viz_gaussian_fig_scale: float = 2.6
     generator: str = "gUnet"  # "gUnet" | "shalow_gUnet" (half) | "shalow_gUnet_xs" (quarter)
     unet_dropout: float = 0.0  # dropout in gUnet ResnetBlocks (0 = off)
+    use_window_pool: bool = False  # True: mmap pool; False: live Zarr random crop each epoch
+    resume_from_best: bool = False  # load best_model.pth and continue from best_epoch + 1
+    resume_best_epoch: int | None = None  # override best epoch when history best_epoch is stale
+    init_model_path: str | None = None  # fine-tune: load generator weights before epoch 1
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AdvNOTrainConfig:
@@ -192,11 +201,11 @@ def _clear_run_artifacts(run_dir: Path, run_name: str) -> None:
                 child.unlink()
 
 
-def _prepare_run_dir(config: AdvNOTrainConfig) -> Path:
+def _prepare_run_dir(config: AdvNOTrainConfig, *, resume: bool = False) -> Path:
     """Create run directory; never delete a previous run with the same name."""
     run_dir = config.run_dir()
     if _run_has_artifacts(run_dir, config.run_name):
-        if config.protect_existing_run:
+        if config.protect_existing_run and not resume:
             raise FileExistsError(
                 f"Run already exists: {run_dir}\n"
                 "Choose a new RUN_NAME / RUN_TAG so each experiment is stored separately. "
@@ -206,10 +215,68 @@ def _prepare_run_dir(config: AdvNOTrainConfig) -> Path:
     return run_dir
 
 
-def _adv_paths(config: AdvNOTrainConfig):
-    run_dir = _prepare_run_dir(config)
+def _adv_paths(config: AdvNOTrainConfig, *, resume: bool = False):
+    run_dir = _prepare_run_dir(config, resume=resume)
     config.checkpoint_dir = str(run_dir)
     return _paths(config)
+
+
+_RESUME_HASH_SKIP = frozenset(
+    {"epochs", "device", "use_multi_gpu", "num_workers", "protect_existing_run"}
+)
+
+
+def _resume_config_hash(config: AdvNOTrainConfig) -> str:
+    """Hash for resume compatibility; excludes fields safe to change when extending a run."""
+    payload = {k: v for k, v in asdict(config).items() if k not in _RESUME_HASH_SKIP}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _config_hashes_compatible(ckpt: dict, config: AdvNOTrainConfig) -> bool:
+    stored_resume = ckpt.get("resume_config_hash")
+    stored = stored_resume or ckpt.get("config_hash")
+    resume_h = _resume_config_hash(config)
+    if stored in {config.config_hash(), resume_h}:
+        return True
+    prev_epochs = ckpt.get("scheduler_g", {}).get("T_max")
+    if prev_epochs is not None:
+        prev_cfg = replace(config, epochs=int(prev_epochs))
+        if stored in {prev_cfg.config_hash(), _resume_config_hash(prev_cfg)}:
+            return True
+    # Legacy checkpoints hashed device/epochs; allow extend when core training config matches.
+    if not stored_resume and int(ckpt.get("epoch", 0)) > 0:
+        prev_epochs = int(prev_epochs or config.epochs)
+        return resume_h == _resume_config_hash(replace(config, epochs=prev_epochs))
+    return False
+
+
+def _maybe_extend_cosine_scheduler(
+    config: AdvNOTrainConfig,
+    optimizer_g: torch.optim.Optimizer,
+    scheduler_g: torch.optim.lr_scheduler._LRScheduler,
+    *,
+    completed_epoch: int,
+    sched_state: dict,
+) -> torch.optim.lr_scheduler._LRScheduler:
+    if not config.use_cosine_lr:
+        scheduler_g.load_state_dict(sched_state)
+        return scheduler_g
+    prev_tmax = int(sched_state.get("T_max", config.epochs))
+    if prev_tmax == int(config.epochs):
+        scheduler_g.load_state_dict(sched_state)
+        return scheduler_g
+    eta_min = config.cosine_eta_min if config.cosine_eta_min is not None else config.lr * 0.01
+    print(
+        f"Extended cosine LR schedule: T_max {prev_tmax} -> {config.epochs} "
+        f"(continuing from epoch {completed_epoch})",
+        flush=True,
+    )
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_g,
+        T_max=config.epochs,
+        eta_min=eta_min,
+        last_epoch=int(completed_epoch),
+    )
 
 
 def _default_adv_hist() -> dict:
@@ -224,6 +291,7 @@ def _default_adv_hist() -> dict:
         "val_l1": [],
         "val_rmse": [],
         "val_perceptual": [],
+        "val_window_rmse": [],
         "lr": [],
         "d_lr": [],
         "best_val_loss": float("inf"),
@@ -240,28 +308,75 @@ def _try_resume_adv_no(
     checkpoint_dir: Path,
     history_path: Path,
     resume_path: Path,
-) -> tuple[int, dict, float, int]:
-    """Resume from resume checkpoint, or history + last_model with optimizer reset."""
+) -> tuple[int, dict, float, int, torch.optim.lr_scheduler._LRScheduler]:
+    """Resume from resume checkpoint, best model, or history + last_model with optimizer reset."""
     start_epoch = 1
     hist = _default_adv_hist()
     best_val_loss = float("inf")
     best_epoch = 0
 
+    if getattr(config, "resume_from_best", False):
+        best_path = _resolve_best_model_path(config)
+        if best_path.exists() and history_path.exists():
+            prev = torch.load(history_path, map_location="cpu", weights_only=False)
+            if prev.get("epoch"):
+                _load_model_state_dict(
+                    model,
+                    torch.load(best_path, map_location=device, weights_only=True),
+                )
+                hist = prev
+                best_val_loss = float(prev.get("best_val_loss", float("inf")))
+                best_epoch = int(
+                    config.resume_best_epoch
+                    if config.resume_best_epoch is not None
+                    else prev.get("best_epoch", 0)
+                )
+                start_epoch = best_epoch + 1
+                if config.use_cosine_lr:
+                    eta_min = (
+                        config.cosine_eta_min
+                        if config.cosine_eta_min is not None
+                        else config.lr * 0.01
+                    )
+                    scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer_g,
+                        T_max=config.epochs,
+                        eta_min=eta_min,
+                        last_epoch=best_epoch,
+                    )
+                else:
+                    for _ in range(best_epoch):
+                        scheduler_g.step()
+                print(
+                    f"Resuming from epoch {start_epoch} using best model "
+                    f"(epoch {best_epoch}, val {best_val_loss:.6f}) | {best_path}",
+                    flush=True,
+                )
+                return start_epoch, hist, best_val_loss, best_epoch, scheduler_g
+        print("resume_from_best: missing best model or history — falling back", flush=True)
+
     if resume_path.exists():
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        if ckpt.get("config_hash") != config.config_hash():
+        if not _config_hashes_compatible(ckpt, config):
             raise RuntimeError(
                 f"Training config changed since last run. Delete {resume_path} or use resume=False."
             )
         _load_model_state_dict(model, ckpt["model"])
         optimizer_g.load_state_dict(ckpt["optimizer_g"])
-        scheduler_g.load_state_dict(ckpt["scheduler_g"])
+        completed_epoch = int(ckpt["epoch"])
+        scheduler_g = _maybe_extend_cosine_scheduler(
+            config,
+            optimizer_g,
+            scheduler_g,
+            completed_epoch=completed_epoch,
+            sched_state=ckpt["scheduler_g"],
+        )
         hist = ckpt["hist"]
         best_val_loss = float(ckpt["best_val_loss"])
         best_epoch = int(ckpt["best_epoch"])
-        start_epoch = int(ckpt["epoch"]) + 1
+        start_epoch = completed_epoch + 1
         print(f"Resuming from epoch {start_epoch} (checkpoint {resume_path})", flush=True)
-        return start_epoch, hist, best_val_loss, best_epoch
+        return start_epoch, hist, best_val_loss, best_epoch, scheduler_g
 
     if history_path.exists():
         prev = torch.load(history_path, map_location="cpu", weights_only=False)
@@ -282,9 +397,9 @@ def _try_resume_adv_no(
                     f"Resuming from epoch {start_epoch} using history + last model (optimizer reset)",
                     flush=True,
                 )
-                return start_epoch, hist, best_val_loss, best_epoch
+                return start_epoch, hist, best_val_loss, best_epoch, scheduler_g
 
-    return start_epoch, hist, best_val_loss, best_epoch
+    return start_epoch, hist, best_val_loss, best_epoch, scheduler_g
 
 
 def _save_adv_resume_checkpoint(
@@ -301,6 +416,7 @@ def _save_adv_resume_checkpoint(
     _atomic_torch_save(
         {
             "config_hash": config.config_hash(),
+            "resume_config_hash": _resume_config_hash(config),
             "epoch": int(epoch),
             "model": _model_state_dict(model),
             "optimizer_g": optimizer_g.state_dict(),
@@ -313,8 +429,8 @@ def _save_adv_resume_checkpoint(
     )
 
 
-def _forward_batch(model, x, d, h_batch, iD: int):
-    return model(x[:, -3 * iD :], d + h_batch / 365.0)
+def _forward_batch(model, x, d, h_batch, iD_in: int):
+    return model(x[:, -3 * iD_in :], d + h_batch / 365.0)
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
@@ -363,6 +479,9 @@ def train_adv_no(
     *,
     resume: bool = False,
 ) -> nn.Module:
+    if config.channel_indices is not None:
+        config.iD = len(config.resolved_target_channel_indices())
+    iD_in = config.resolved_input_channels()
     device = config.device if torch.cuda.is_available() else "cpu"
     recon_label = "speed L1" if config.loss_metric == "speed" else "uv L1"
     val_recon_label = (
@@ -372,7 +491,16 @@ def train_adv_no(
     )
     print(f"Using device: {device}", flush=True)
     print(f"Loss mode: {config.loss_mode}", flush=True)
-    print(f"Channels: iD={config.iD} ({', '.join(config.channel_names[: config.iD])})", flush=True)
+    ch_idx = config.resolved_channel_indices()
+    ch_tgt = config.resolved_target_channel_indices()
+    ch_label = ", ".join(config.channel_names[: config.iD])
+    if config.channel_indices is not None:
+        print(
+            f"Channels: in={iD_in} {list(ch_idx)} | out={config.iD} {list(ch_tgt)} ({ch_label})",
+            flush=True,
+        )
+    else:
+        print(f"Channels: iD={config.iD} ({ch_label})", flush=True)
     print(f"Reconstruction metric: {config.loss_metric} ({recon_label})", flush=True)
     print(f"Validation metric: {config.val_reconstruction_metric} ({val_recon_label})", flush=True)
     print(f"Optimizer: {config.optimizer} (lr={config.lr:g})", flush=True)
@@ -500,10 +628,13 @@ def train_adv_no(
         va_day = pool_day[val_idx]
         va_hour = pool_hour[val_idx]
         va_windows = pool_windows[val_idx] if pool_windows is not None else None
-        mean, std = norm_stats_from_exported_sims(
+        ch_idx = config.resolved_channel_indices()
+        ch_tgt = config.resolved_target_channel_indices()
+        mean_x, std_x, mean_y, std_y = norm_stats_from_exported_sims(
             config.data_prefix,
             stats_train_idx,
-            iD=config.iD,
+            channel_indices=ch_idx,
+            target_channel_indices=ch_tgt,
         )
         export_cfg = pool["export_config"]
         export_cfg.max_mask_frac = float(getattr(config, "max_mask_frac", export_cfg.max_mask_frac))
@@ -511,12 +642,125 @@ def train_adv_no(
             getattr(config, "max_crop_attempts", export_cfg.max_crop_attempts)
         )
         train_k = int(getattr(config, "train_crops_per_anchor", 1) or 1)
-        tr_epoch_windows = load_epoch_windows(config.data_prefix, train_k)
-        if tr_epoch_windows is not None:
+        window_pool = (
+            load_window_pool(config.data_prefix, train_k)
+            if getattr(config, "use_window_pool", False)
+            else None
+        )
+        tr_epoch_windows = None if window_pool else load_epoch_windows(config.data_prefix, train_k)
+        if window_pool is not None:
+            fixed_slot = getattr(config, "fixed_window_slot", None)
+            slots_pe = int(getattr(config, "slots_per_epoch", None) or 1)
+            if fixed_slot is not None:
+                fixed_slot = int(fixed_slot)
+                slots_pe = 1
+                slots_note = (
+                    f"fixed catalog slot {fixed_slot} (W{fixed_slot + 1}) -> "
+                    f"{len(train_idx)} train rows/epoch"
+                )
+            else:
+                slots_note = (
+                    f"{slots_pe} window(s)/snapshot/epoch -> "
+                    f"{len(train_idx) * slots_pe} train rows/epoch"
+                )
+            print(
+                f"Window pool cache: {window_pool['sims'].shape} "
+                f"(k={train_k}, {window_pool['n_windows']} crops/row, {slots_note}, no Zarr)",
+                flush=True,
+            )
+            train_set = WindowPoolCachedDataset(
+                window_pool["sims"],
+                window_pool["mask"],
+                train_idx,
+                tr_day,
+                tr_hour,
+                mean_x=mean_x,
+                std_x=std_x,
+                mean_y=mean_y,
+                std_y=std_y,
+                channel_indices=ch_idx,
+                target_channel_indices=ch_tgt,
+                crop_seed=int(getattr(config, "random_crop_seed", 42)),
+                n_windows=window_pool["n_windows"],
+                slots_per_epoch=slots_pe,
+                fixed_window_slot=fixed_slot,
+            )
+            val_set = WindowPoolEvalDataset(
+                window_pool["sims"],
+                window_pool["mask"],
+                val_idx,
+                va_day,
+                va_hour,
+                mean_x=mean_x,
+                std_x=std_x,
+                mean_y=mean_y,
+                std_y=std_y,
+                channel_indices=ch_idx,
+                target_channel_indices=ch_tgt,
+                window_slot=fixed_slot,
+            )
+            val_viz_set = WindowPoolEvalDataset(
+                window_pool["sims"],
+                window_pool["mask"],
+                val_idx,
+                va_day,
+                va_hour,
+                mean_x=mean_x,
+                std_x=std_x,
+                mean_y=mean_y,
+                std_y=std_y,
+                channel_indices=ch_idx,
+                target_channel_indices=ch_tgt,
+                window_slot=fixed_slot if fixed_slot is not None else 0,
+            )
+            n_val_snap = len(val_idx)
+            if fixed_slot is not None:
+                print(
+                    f"Val eval: catalog window slot {fixed_slot} (W{fixed_slot + 1}) × "
+                    f"{n_val_snap} snapshots = {len(val_set)} items",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Val eval: all {window_pool['n_windows']} windows × {n_val_snap} snapshots "
+                    f"= {len(val_set)} items (no random slot)",
+                    flush=True,
+                )
+        elif tr_epoch_windows is not None:
             print(
                 f"Pre-exported epoch windows: {tr_epoch_windows.shape} "
                 f"(k={train_k}, read per epoch — no train-time random crop)",
                 flush=True,
+            )
+            train_set = RandomWindowZarrDataset(
+                tr_zidx,
+                tr_day,
+                tr_hour,
+                export_cfg,
+                mean_x=mean_x,
+                std_x=std_x,
+                mean_y=mean_y,
+                std_y=std_y,
+                channel_indices=ch_idx,
+                target_channel_indices=ch_tgt,
+                epoch_windows=tr_epoch_windows,
+                random_crop=False,
+                crop_seed=int(getattr(config, "random_crop_seed", 42)),
+            )
+            val_set = RandomWindowZarrDataset(
+                va_zidx,
+                va_day,
+                va_hour,
+                export_cfg,
+                mean_x=mean_x,
+                std_x=std_x,
+                mean_y=mean_y,
+                std_y=std_y,
+                channel_indices=ch_idx,
+                target_channel_indices=ch_tgt,
+                fixed_windows=va_windows,
+                random_crop=False,
+                crop_seed=int(getattr(config, "random_crop_seed", 42)),
             )
         else:
             print(
@@ -524,37 +768,67 @@ def train_adv_no(
                 f"val fixed windows from export | max land < {export_cfg.max_mask_frac:.0%}",
                 flush=True,
             )
-        train_set = RandomWindowZarrDataset(
-            tr_zidx,
-            tr_day,
-            tr_hour,
-            export_cfg,
-            mean=mean,
-            std=std,
-            iD=config.iD,
-            epoch_windows=tr_epoch_windows,
-            random_crop=tr_epoch_windows is None,
-            crop_seed=int(getattr(config, "random_crop_seed", 42)),
-        )
-        val_set = RandomWindowZarrDataset(
-            va_zidx,
-            va_day,
-            va_hour,
-            export_cfg,
-            mean=mean,
-            std=std,
-            iD=config.iD,
-            fixed_windows=va_windows,
-            random_crop=False,
-            crop_seed=int(getattr(config, "random_crop_seed", 42)),
-        )
+            train_set = RandomWindowZarrDataset(
+                tr_zidx,
+                tr_day,
+                tr_hour,
+                export_cfg,
+                mean_x=mean_x,
+                std_x=std_x,
+                mean_y=mean_y,
+                std_y=std_y,
+                channel_indices=ch_idx,
+                target_channel_indices=ch_tgt,
+                random_crop=True,
+                crop_seed=int(getattr(config, "random_crop_seed", 42)),
+            )
+            val_set = RandomWindowZarrDataset(
+                va_zidx,
+                va_day,
+                va_hour,
+                export_cfg,
+                mean_x=mean_x,
+                std_x=std_x,
+                mean_y=mean_y,
+                std_y=std_y,
+                channel_indices=ch_idx,
+                target_channel_indices=ch_tgt,
+                fixed_windows=va_windows,
+                random_crop=False,
+                crop_seed=int(getattr(config, "random_crop_seed", 42)),
+            )
         train_size = len(train_set)
         val_size = len(val_set)
     else:
-        train_set = SimulationDataset(train_data, train_mask, train_day, train_hour, iD=config.iD)
-        val_set = SimulationDataset(
-            val_data, val_mask, val_day, val_hour, mean=train_set.mean, std=train_set.std, iD=config.iD
+        ch_idx = config.resolved_channel_indices()
+        ch_tgt = config.resolved_target_channel_indices()
+        train_set = SimulationDataset(
+            train_data,
+            train_mask,
+            train_day,
+            train_hour,
+            channel_indices=ch_idx,
+            target_channel_indices=ch_tgt,
         )
+        val_set = SimulationDataset(
+            val_data,
+            val_mask,
+            val_day,
+            val_hour,
+            mean=train_set.mean,
+            std=train_set.std,
+            mean_x=train_set.mean_x,
+            std_x=train_set.std_x,
+            channel_indices=ch_idx,
+            target_channel_indices=ch_tgt,
+        )
+        val_viz_set = val_set
+
+    val_viz_set = locals().get("val_viz_set", val_set)
+    use_window_pool_eval = (
+        isinstance(val_set, WindowPoolEvalDataset) and val_set.window_slot is None
+    )
+    n_eval_windows = int(val_set.n_windows) if use_window_pool_eval else 0
 
     run_dir = config.run_dir()
     if not resume and _run_has_artifacts(run_dir, config.run_name):
@@ -565,7 +839,7 @@ def train_adv_no(
     best_val_loss = float("inf")
     best_epoch = 0
 
-    config_path, state_path, history_path, resume_path = _adv_paths(config)
+    config_path, state_path, history_path, resume_path = _adv_paths(config, resume=resume)
     config_path.write_text(json.dumps(asdict(config), indent=2, default=str))
 
     train_loader = _build_adv_dataloader(train_set, config, shuffle=True)
@@ -601,7 +875,7 @@ def train_adv_no(
         )
 
     if resume:
-        start_epoch, hist, best_val_loss, best_epoch = _try_resume_adv_no(
+        start_epoch, hist, best_val_loss, best_epoch, scheduler_g = _try_resume_adv_no(
             config,
             model,
             optimizer_g,
@@ -615,6 +889,16 @@ def train_adv_no(
         start_epoch = 1
         if resume_path.exists():
             resume_path.unlink()
+
+    init_model_path = getattr(config, "init_model_path", None)
+    if init_model_path and start_epoch == 1 and not resume:
+        init_path = Path(init_model_path)
+        if not init_path.is_file():
+            raise FileNotFoundError(f"init_model_path not found: {init_path}")
+        ckpt = torch.load(init_path, map_location=device, weights_only=False)
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        _load_model_state_dict(model, state)
+        print(f"Fine-tune init: loaded generator weights from {init_path}", flush=True)
 
     if config.viz_gaussian_circles:
         ensure_circle_l1_hist(
@@ -663,7 +947,7 @@ def train_adv_no(
     else:
         (viz_root / "samples").mkdir(parents=True, exist_ok=True)
     (viz_root / "curves").mkdir(parents=True, exist_ok=True)
-    viz_indices = fixed_viz_indices(config.viz_samples, val_size, config.viz_seed)
+    viz_indices = fixed_viz_indices(config.viz_samples, len(val_viz_set), config.viz_seed)
     if config.val_data_prefix:
         global_viz_indices = viz_indices
     else:
@@ -763,7 +1047,7 @@ def train_adv_no(
 
     if config.preview_val_mask and val_size > 0:
         val_mask_path = save_validation_mask_preview(
-            val_set,
+            val_viz_set,
             viz_root / "val_mask_preview.png",
             sample_indices=viz_indices,
             global_sample_indices=global_viz_indices,
@@ -807,7 +1091,7 @@ def train_adv_no(
                 target = y[:, : config.iD]
 
                 optimizer_g.zero_grad()
-                pred = _forward_batch(model, x, d, h_batch, config.iD)
+                pred = _forward_batch(model, x, d, h_batch, iD_in)
 
                 if not use_perc:
                     loss = reconstruction_loss(
@@ -833,7 +1117,7 @@ def train_adv_no(
                     if use_adv:
                         optimizer_d.zero_grad()
                         with torch.no_grad():
-                            pred_d = _forward_batch(model, x, d, h_batch, config.iD)
+                            pred_d = _forward_batch(model, x, d, h_batch, iD_in)
                         d_loss = adv_loss_fn.discriminator_loss(
                             pred_d, target, m, discriminator, spatial_weight=loss_spatial_weight
                         )
@@ -858,30 +1142,47 @@ def train_adv_no(
 
             model.eval()
             val_l1 = val_rmse = val_perceptual = 0.0
+            val_window_metrics: dict[str, Any] = {}
             with torch.no_grad():
-                for x, y, m, d, h_batch in val_loader:
-                    x, y, m, d, h_batch = (
-                        x.to(device),
-                        y.to(device),
-                        m.to(device),
-                        d.to(device),
-                        h_batch.to(device),
+                if use_window_pool_eval:
+                    val_window_metrics = evaluate_window_pool_metrics(
+                        model,
+                        val_loader,
+                        device,
+                        iD_in=iD_in,
+                        n_windows=n_eval_windows,
+                        loss_spatial_weight=loss_spatial_weight,
+                        loss_metric=config.loss_metric,
+                        mean_y=mean_y,
+                        std_y=std_y,
                     )
-                    pred = _forward_batch(model, x, d, h_batch, config.iD)
-                    target = y[:, : config.iD]
-                    metrics = adv_loss_fn.validation_metrics(
-                        pred,
-                        target,
-                        m,
-                        spatial_weight=loss_spatial_weight,
-                    )
-                    val_l1 += metrics["l1"] * x.size(0)
-                    val_rmse += metrics["rmse"] * x.size(0)
-                    val_perceptual += metrics["perceptual"] * x.size(0)
+                    val_rmse = float(val_window_metrics["overall_rmse"])
+                    val_l1 = float(val_window_metrics["overall_l1"])
+                    val_perceptual = 0.0
+                else:
+                    for x, y, m, d, h_batch in val_loader:
+                        x, y, m, d, h_batch = (
+                            x.to(device),
+                            y.to(device),
+                            m.to(device),
+                            d.to(device),
+                            h_batch.to(device),
+                        )
+                        pred = _forward_batch(model, x, d, h_batch, iD_in)
+                        target = y[:, : config.iD]
+                        metrics = adv_loss_fn.validation_metrics(
+                            pred,
+                            target,
+                            m,
+                            spatial_weight=loss_spatial_weight,
+                        )
+                        val_l1 += metrics["l1"] * x.size(0)
+                        val_rmse += metrics["rmse"] * x.size(0)
+                        val_perceptual += metrics["perceptual"] * x.size(0)
 
-            val_l1 /= val_size
-            val_rmse /= val_size
-            val_perceptual /= val_size
+                    val_l1 /= val_size
+                    val_rmse /= val_size
+                    val_perceptual /= val_size
             val_loss = val_rmse if config.val_reconstruction_metric == "rmse" else val_l1
 
             if config.use_cosine_lr:
@@ -906,20 +1207,27 @@ def train_adv_no(
             hist["val_l1"].append(val_l1)
             hist["val_rmse"].append(val_rmse)
             hist["val_perceptual"].append(val_perceptual)
+            hist["val_window_rmse"].append(val_window_metrics if val_window_metrics else {})
             hist["lr"].append(current_lr)
             hist["d_lr"].append(current_d_lr)
             hist["best_val_loss"] = best_val_loss
             hist["best_epoch"] = best_epoch
             _atomic_torch_save(hist, history_path)
+            if val_window_metrics:
+                win_path = run_dir / f"val_window_metrics_epoch_{epoch:03d}.json"
+                win_path.write_text(json.dumps(val_window_metrics, indent=2))
+                latest_path = run_dir / "val_window_metrics_latest.json"
+                latest_path.write_text(json.dumps(val_window_metrics, indent=2))
 
             if config.viz_gaussian_circles and config.viz_gaussian_inner_circle_radii:
                 circle_metrics = compute_viz_sample_circle_l1(
                     model,
-                    val_set,
+                    val_viz_set,
                     device,
                     viz_indices,
                     config.iD,
                     tuple(config.viz_gaussian_inner_circle_radii),
+                    iD_in=iD_in,
                     channel_names=config.channel_names,
                 )
                 for radius, ch_metrics in circle_metrics.items():
@@ -936,6 +1244,7 @@ def train_adv_no(
                 perceptual_label=perceptual_backend_label(
                     config.perceptual_backend, config.lpips_net
                 ),
+                n_windows=n_eval_windows,
             )
             if config.viz_gaussian_circles:
                 viz_note = (
@@ -1040,6 +1349,7 @@ def train_adv_no(
                         device,
                         viz_root,
                         iD=config.iD,
+                        iD_in=iD_in,
                         epoch=epoch,
                         sample_indices=viz_indices,
                         channel_names=config.channel_names,
@@ -1057,10 +1367,11 @@ def train_adv_no(
                 else:
                     viz_paths = save_fix_window_validation_figures(
                         model,
-                        val_set,
+                        val_viz_set,
                         device,
                         viz_root,
                         iD=config.iD,
+                        iD_in=iD_in,
                         epoch=epoch,
                         sample_indices=viz_indices,
                         residual_metric=config.viz_residual_metric,

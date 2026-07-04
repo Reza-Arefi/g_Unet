@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from src.export.random_window_export import (
     RandomWindowExportConfig,
     export_train_epoch_windows,
+    export_window_pools,
     merge_export_chunks,
     run_export,
 )
@@ -50,6 +51,11 @@ def main() -> int:
         action="store_true",
         help="Only pre-export per-epoch train windows (pool .npy must exist)",
     )
+    parser.add_argument(
+        "--window-pool-only",
+        action="store_true",
+        help="Only export 12-window pools with cached sims (pool .npy must exist)",
+    )
     args = parser.parse_args()
 
     if args.config:
@@ -71,6 +77,10 @@ def main() -> int:
 
     if args.epoch_windows_only:
         export_train_epoch_windows(config)
+        return 0
+
+    if args.window_pool_only:
+        export_window_pools(config)
         return 0
 
     run_export(config, resume=not args.no_resume)

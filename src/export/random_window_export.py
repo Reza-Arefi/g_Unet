@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from joblib import Parallel, delayed
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +20,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.dataloaders.guiana_margem_tensor import GuianaDataloader
+from src.data.useful_transforms import FixedCrop, RotatedFixedCrop
 from src.export.fix_window_export import (
+    _append_bathymetry_channel,
+    _bathymetry_field_2d,
     candidate_indices_for_hour,
     stack_time_channels,
     transform_export_channels,
@@ -51,14 +55,22 @@ class RandomWindowExportConfig:
     channel_names: tuple[str, ...] = ("u", "v")
     target_channel_indices: tuple[int, ...] = (0, 1)
     export_key: str = "random_win_128"
-    # Pre-export train crop windows per epoch (matches dynamic training RNG; read at train time).
-    export_epoch_windows: bool = True
+    # "random": free crop positions | "catalog": fixed slots from window_selection.ipynb
+    window_mode: str = "random"
+    catalog_id: str | None = None
+    # Legacy: per-epoch windows (slow — one S3 read per epoch × sample).
+    export_epoch_windows: bool = False
     n_export_epochs: int = 100
     random_crop_seed: int = 42
     val_split: float = 0.3
     val_split_mode: str = "random"  # "random" | "chronological"
     val_split_seed: int = 42
-    train_crops_for_epoch_windows: tuple[int, ...] = (1, 2)  # k1 and k2 row filters
+    train_crops_for_epoch_windows: tuple[int, ...] = (1, 2)
+    # Fast path: N random crops per pool row, cached sims — train picks one per epoch (no Zarr).
+    export_window_pool: bool = True
+    n_windows_per_sample: int = 12
+    train_crops_for_window_pool: tuple[int, ...] = (1, 2)
+    train_slots_per_epoch: int = 6  # catalog pool: train picks this many of n_windows each epoch
 
     @property
     def n_channels(self) -> int:
@@ -84,7 +96,54 @@ class RandomWindowExportConfig:
             values["train_crops_for_epoch_windows"] = tuple(
                 int(x) for x in values["train_crops_for_epoch_windows"]
             )
+        if "train_crops_for_window_pool" in values and isinstance(
+            values["train_crops_for_window_pool"], list
+        ):
+            values["train_crops_for_window_pool"] = tuple(
+                int(x) for x in values["train_crops_for_window_pool"]
+            )
         return cls(**values)
+
+
+def _build_export_sequence(
+    dataset,
+    idx: int,
+    *,
+    channel_names: tuple[str, ...],
+    sample: tuple | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load one sequence on the full grid. Returns ``(seq, mask)``."""
+    if sample is None:
+        x, y, mask = dataset[int(idx)]
+    else:
+        x, y, mask = sample
+    names = tuple(channel_names)
+    include_bathy = "bathymetry" in names
+
+    if names == ("bathymetry",):
+        bat2d = _bathymetry_field_2d(y["bat"].detach().cpu().numpy())
+        total_steps = int(dataset.conditioning_steps + dataset.forecast_steps)
+        seq = np.broadcast_to(
+            bat2d[np.newaxis, np.newaxis, :, :],
+            (total_steps, 1, bat2d.shape[0], bat2d.shape[1]),
+        ).copy()
+    else:
+        dyn_names = tuple(c for c in names if c != "bathymetry")
+        n_dyn = len(dyn_names)
+        cond_steps = dataset.conditioning_steps
+        fcst_steps = dataset.forecast_steps
+        cond = stack_time_channels(y["y"], cond_steps, n_channels=n_dyn)
+        fcst = stack_time_channels(x, fcst_steps, n_channels=n_dyn)
+        seq = np.concatenate([cond, fcst], axis=0)
+        seq = transform_export_channels(seq, dyn_names)
+        if include_bathy:
+            bat = y["bat"].detach().cpu().numpy()
+            seq = _append_bathymetry_channel(seq, bat)
+
+    mask_np = mask.detach().cpu().numpy()
+    if mask_np.ndim == 3:
+        mask_np = mask_np[0]
+    return seq, mask_np.astype(np.float32, copy=False)
 
 
 def load_sequence_at_window(
@@ -98,20 +157,12 @@ def load_sequence_at_window(
     channel_names: tuple[str, ...] = ("u", "v"),
 ):
     """Load one sequence on the full grid, then crop to ``(top, left, crop_h, crop_w)``."""
-    x, y, mask = dataset[int(idx)]
-    n_channels = len(channel_names)
-    cond_steps = dataset.conditioning_steps
-    fcst_steps = dataset.forecast_steps
-
-    cond = stack_time_channels(y["y"], cond_steps, n_channels=n_channels)
-    fcst = stack_time_channels(x, fcst_steps, n_channels=n_channels)
-    seq = np.concatenate([cond, fcst], axis=0)
-    seq = transform_export_channels(seq, channel_names)
+    sample = dataset[int(idx)]
+    y = sample[1]
+    seq, mask_np = _build_export_sequence(
+        dataset, int(idx), channel_names=channel_names, sample=sample
+    )
     seq = seq[..., top : top + crop_h, left : left + crop_w]
-
-    mask_np = mask.detach().cpu().numpy()
-    if mask_np.ndim == 3:
-        mask_np = mask_np[0]
     mask_crop = mask_np[top : top + crop_h, left : left + crop_w]
 
     latlon_grid = y["latlon_grid"].detach().cpu().numpy()
@@ -121,6 +172,96 @@ def load_sequence_at_window(
 
     times = dataset.sample_times(int(idx))
     return seq, mask_crop, times, latlon
+
+
+def load_full_export_sequence(
+    dataset,
+    idx: int,
+    *,
+    channel_names: tuple[str, ...] = ("u", "v"),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load one sequence on the full grid (single Zarr read). Returns ``(seq, mask)``."""
+    return _build_export_sequence(dataset, int(idx), channel_names=channel_names)
+
+
+def _resolved_catalog_for_config(config: RandomWindowExportConfig) -> list[dict[str, Any]]:
+    if config.window_mode != "catalog":
+        raise ValueError("catalog requested but window_mode is not 'catalog'")
+    if not config.catalog_id:
+        raise ValueError("window_mode='catalog' requires catalog_id")
+    from Magic_window.window_catalog import get_resolved_catalog
+
+    catalog = get_resolved_catalog(config.catalog_id)
+    if int(config.n_windows_per_sample) != len(catalog):
+        raise ValueError(
+            f"n_windows_per_sample={config.n_windows_per_sample} but catalog "
+            f"{config.catalog_id!r} has {len(catalog)} windows"
+        )
+    return catalog
+
+
+def _catalog_crop_transform(spec: dict[str, Any]):
+    crop_h = int(spec["crop_height"])
+    crop_w = int(spec["crop_width"])
+    top = int(spec["window_top"])
+    left = int(spec["window_left"])
+    angle = float(spec["window_angle"])
+    if angle == 0.0:
+        return FixedCrop(size=(crop_h, crop_w), top=top, left=left)
+    return RotatedFixedCrop(
+        size=(crop_h, crop_w),
+        top=top,
+        left=left,
+        angle_deg=angle,
+    )
+
+
+def crop_sequence_with_catalog_window(
+    seq: np.ndarray,
+    mask_full: np.ndarray,
+    spec: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Crop a full-grid sequence and mask using one catalog window (supports rotation)."""
+    crop_t = _catalog_crop_transform(spec)
+    t_seq = torch.from_numpy(np.asarray(seq, dtype=np.float32))
+    t_mask = torch.from_numpy(np.asarray(mask_full, dtype=np.float32))
+    leading = t_seq.shape[:-2]
+    h, w = t_seq.shape[-2:]
+    flat_seq = t_seq.reshape(-1, h, w)
+    flat_mask = t_mask.reshape(1, h, w)
+    crop_h = int(spec["crop_height"])
+    crop_w = int(spec["crop_width"])
+    seq_crop = crop_t(flat_seq).numpy().reshape(*leading, crop_h, crop_w)
+    mask_crop = crop_t(flat_mask).numpy().reshape(crop_h, crop_w)
+    return seq_crop, mask_crop
+
+
+def window_array_from_spec(spec: dict[str, Any]) -> np.ndarray:
+    """``[top, left, h, w, angle]`` — angle enables per-window loss bookkeeping."""
+    return np.array(
+        [
+            spec["window_top"],
+            spec["window_left"],
+            spec["crop_height"],
+            spec["crop_width"],
+            spec["window_angle"],
+        ],
+        dtype=np.float64,
+    )
+
+
+def crop_export_sequence(
+    seq: np.ndarray,
+    mask_full: np.ndarray,
+    *,
+    top: int,
+    left: int,
+    crop_h: int,
+    crop_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    seq_crop = seq[..., top : top + crop_h, left : left + crop_w]
+    mask_crop = mask_full[top : top + crop_h, left : left + crop_w]
+    return seq_crop, mask_crop
 
 
 def _build_dataset(config: RandomWindowExportConfig):
@@ -225,6 +366,41 @@ def _process_sample(
     rng = np.random.default_rng([config.seed, int(idx), int(crop_slot)])
     anchor_idx = config.conditioning_steps - 1
 
+    if config.window_mode == "catalog":
+        catalog = _resolved_catalog_for_config(config)
+        sample = dataset[int(idx)]
+        y = sample[1]
+        seq_full, mask_full = _build_export_sequence(
+            dataset,
+            int(idx),
+            channel_names=config.channel_names,
+            sample=sample,
+        )
+        times = dataset.sample_times(int(idx))
+        latlon_grid = y["latlon_grid"].detach().cpu().numpy()
+
+        for _ in range(config.max_crop_attempts):
+            win_i = int(rng.integers(0, len(catalog)))
+            spec = catalog[win_i]
+            seq, mask = crop_sequence_with_catalog_window(seq_full, mask_full, spec)
+            mask_frac = float(mask.mean())
+            if mask_frac >= config.max_mask_frac:
+                continue
+
+            cy = int(spec["window_top"]) + crop_h // 2
+            cx = int(spec["window_left"]) + crop_w // 2
+            cy = min(max(cy, 0), h - 1)
+            cx = min(max(cx, 0), w - 1)
+            latlon = [float(latlon_grid[0, cy, cx]), float(latlon_grid[1, cy, cx])]
+
+            t_labels = [str(t)[:16] for t in times]
+            dt = datetime.strptime(t_labels[anchor_idx], "%Y-%m-%d %H:%M")
+            day_of_year = dt.timetuple().tm_yday
+            hour = dt.hour
+            window = window_array_from_spec(spec)
+            return seq, mask, day_of_year, hour, latlon, window
+        return None
+
     for _ in range(config.max_crop_attempts):
         top = int(rng.integers(0, h - crop_h + 1))
         left = int(rng.integers(0, w - crop_w + 1))
@@ -245,7 +421,7 @@ def _process_sample(
         dt = datetime.strptime(t_labels[anchor_idx], "%Y-%m-%d %H:%M")
         day_of_year = dt.timetuple().tm_yday
         hour = dt.hour
-        window = np.array([top, left, crop_h, crop_w], dtype=np.float64)
+        window = np.array([top, left, crop_h, crop_w, 0.0], dtype=np.float64)
         return seq, mask, day_of_year, hour, latlon, window
 
     return None
@@ -263,7 +439,7 @@ def _paths(config: RandomWindowExportConfig):
 
 
 def _clear_export_progress(config: RandomWindowExportConfig) -> None:
-    """Remove chunk dir and resume state so export can start from scratch."""
+    """Remove chunk dir, resume state, and merged outputs so export can start from scratch."""
     _, chunks_dir, state_path, indices_path, crop_slots_path, _ = _paths(config)
     if state_path.exists():
         state_path.unlink()
@@ -273,6 +449,31 @@ def _clear_export_progress(config: RandomWindowExportConfig) -> None:
         indices_path.unlink()
     if crop_slots_path.exists():
         crop_slots_path.unlink()
+
+    prefix = str(config.output_prefix)
+    for suffix in (
+        "_sims.npy",
+        "_mask.npy",
+        "_day.npy",
+        "_hour.npy",
+        "_latlon.npy",
+        "_windows.npy",
+        "_window.npy",
+        "_window_catalog.json",
+        "_window_pool_meta.json",
+        "_epoch_windows_meta.json",
+    ):
+        path = Path(f"{prefix}{suffix}")
+        if path.exists():
+            path.unlink()
+    for pattern in (
+        "_sims_pool_k*.npy",
+        "_mask_pool_k*.npy",
+        "_windows_pool_k*.npy",
+        "_windows_per_epoch_k*.npy",
+    ):
+        for path in Path(prefix).parent.glob(f"{Path(prefix).name}{pattern}"):
+            path.unlink()
 
 
 def export_wants_fresh_start(config: RandomWindowExportConfig, *, resume: bool = True) -> bool:
@@ -307,7 +508,7 @@ def _pack_chunk_results(
     day = np.zeros((n,), dtype=np.int16)
     hour = np.zeros((n,), dtype=np.int8)
     latlon = np.zeros((n, 2), dtype=np.float32)
-    windows = np.zeros((n, 4), dtype=np.float64)
+    windows = np.zeros((n, 5), dtype=np.float64)
 
     for i, (seq, m, d, h, ll, win) in enumerate(valid):
         sims[i] = seq
@@ -332,7 +533,7 @@ def _init_state(config: RandomWindowExportConfig, resume: bool) -> dict[str, Any
     _, chunks_dir, state_path, indices_path, crop_slots_path, config_path = _paths(config)
 
     config_dict = asdict(config)
-    config_dict["window_mode"] = "random"
+    config_dict["window_mode"] = config.window_mode
     config_path.write_text(json.dumps(config_dict, indent=2, default=str))
 
     if not resume:
@@ -427,7 +628,9 @@ def run_export(config: RandomWindowExportConfig, *, resume: bool = True) -> dict
     state = _init_state(config, resume=resume)
 
     if state.get("status") == "finished":
-        if config.export_epoch_windows:
+        if config.export_window_pool:
+            _maybe_export_window_pools(config)
+        elif config.export_epoch_windows:
             _maybe_export_epoch_windows(config)
         return state
 
@@ -516,8 +719,17 @@ def merge_export_chunks(
     data_latlon = np.concatenate([p["latlon"] for p in parts], axis=0)
     data_windows = np.concatenate([p["windows"] for p in parts], axis=0)
 
-    # Sentinel for legacy loaders: random mode (top/left vary per sample; see _windows.npy).
-    window_meta = np.array([-1.0, -1.0, config.crop_height, config.crop_width, 0.0], dtype=np.float64)
+    if config.window_mode == "catalog":
+        window_meta = np.array(
+            [-2.0, -2.0, config.crop_height, config.crop_width, 0.0],
+            dtype=np.float64,
+        )
+    else:
+        # Sentinel for legacy loaders: random mode (top/left vary per sample; see _windows.npy).
+        window_meta = np.array(
+            [-1.0, -1.0, config.crop_height, config.crop_width, 0.0],
+            dtype=np.float64,
+        )
 
     np.save(f"{config.output_prefix}_sims.npy", data_sims)
     np.save(f"{config.output_prefix}_mask.npy", data_mask)
@@ -538,8 +750,18 @@ def merge_export_chunks(
     print("Saved:")
     print(f"  {config.output_prefix}_sims.npy     {data_sims.shape}")
     print(f"  {config.output_prefix}_mask.npy     {data_mask.shape}")
-    print(f"  {config.output_prefix}_windows.npy  {data_windows.shape}  [top, left, h, w] per sample")
-    print(f"  {config.output_prefix}_window.npy   {window_meta}  (random-window sentinel)")
+    print(
+        f"  {config.output_prefix}_windows.npy  {data_windows.shape}  "
+        f"[top, left, h, w, angle] per sample"
+    )
+    mode_note = "catalog-window sentinel" if config.window_mode == "catalog" else "random-window sentinel"
+    print(f"  {config.output_prefix}_window.npy   {window_meta}  ({mode_note})")
+    if config.window_mode == "catalog":
+        from Magic_window.window_catalog import write_catalog_manifest
+
+        catalog_path = Path(f"{config.output_prefix}_window_catalog.json")
+        write_catalog_manifest(catalog_path)
+        print(f"  {catalog_path}  (slot -> export_key for per-window loss)")
     print(f"  channels: {list(config.channel_names)} | target (GT/pred): {target_names}")
     if data_sims.shape[0]:
         print(f"  exported hours: {sorted(set(int(h) for h in data_hour))}")
@@ -548,7 +770,9 @@ def merge_export_chunks(
             f"min={land_fracs.min():.2%} max={land_fracs.max():.2%}"
         )
 
-    if config.export_epoch_windows:
+    if config.export_window_pool:
+        _maybe_export_window_pools(config)
+    elif config.export_epoch_windows:
         export_train_epoch_windows(config)
 
 
@@ -691,3 +915,217 @@ def export_train_epoch_windows(config: RandomWindowExportConfig) -> None:
     }
     meta_path.write_text(json.dumps(meta, indent=2))
     print(f"Saved epoch-window metadata: {meta_path}", flush=True)
+
+
+def _pool_paths(prefix: str, k: int) -> tuple[Path, Path, Path]:
+    tag = f"k{int(k)}"
+    return (
+        Path(f"{prefix}_sims_pool_{tag}.npy"),
+        Path(f"{prefix}_mask_pool_{tag}.npy"),
+        Path(f"{prefix}_windows_pool_{tag}.npy"),
+    )
+
+
+def _sample_catalog_window_pool_for_row(
+    dataset,
+    zarr_idx: int,
+    config: RandomWindowExportConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One Zarr read, then one crop per catalog slot (fixed window order)."""
+    catalog = _resolved_catalog_for_config(config)
+    n_win = len(catalog)
+    crop_h, crop_w = config.crop_height, config.crop_width
+
+    seq_full, mask_full = load_full_export_sequence(
+        dataset, int(zarr_idx), channel_names=config.channel_names
+    )
+    total_steps = int(seq_full.shape[0])
+    n_ch = int(seq_full.shape[1])
+    sims = np.zeros((n_win, total_steps, n_ch, crop_h, crop_w), dtype=np.float32)
+    masks = np.zeros((n_win, crop_h, crop_w), dtype=np.float32)
+    windows = np.zeros((n_win, 5), dtype=np.float64)
+
+    for slot, spec in enumerate(catalog):
+        seq_c, mask_c = crop_sequence_with_catalog_window(seq_full, mask_full, spec)
+        if float(mask_c.mean()) >= float(config.max_mask_frac):
+            raise RuntimeError(
+                f"Catalog window slot {slot} ({spec['export_key']}) exceeds max_mask_frac "
+                f"for zarr idx {zarr_idx}"
+            )
+        sims[slot] = seq_c
+        masks[slot] = mask_c
+        windows[slot] = window_array_from_spec(spec)
+    return sims, masks, windows
+
+
+def _sample_window_pool_for_row(
+    dataset,
+    zarr_idx: int,
+    pool_row: int,
+    config: RandomWindowExportConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One Zarr read, then ``n_windows_per_sample`` valid crops."""
+    if config.window_mode == "catalog":
+        return _sample_catalog_window_pool_for_row(dataset, zarr_idx, config)
+
+    n_win = int(config.n_windows_per_sample)
+    crop_h, crop_w = config.crop_height, config.crop_width
+    h, w = _grid_size(dataset)
+    if h < crop_h or w < crop_w:
+        raise ValueError(f"Crop {crop_h}x{crop_w} does not fit grid {h}x{w}")
+
+    seq_full, mask_full = load_full_export_sequence(
+        dataset, int(zarr_idx), channel_names=config.channel_names
+    )
+    total_steps = int(seq_full.shape[0])
+    n_ch = int(seq_full.shape[1])
+    sims = np.zeros((n_win, total_steps, n_ch, crop_h, crop_w), dtype=np.float32)
+    masks = np.zeros((n_win, crop_h, crop_w), dtype=np.float32)
+    windows = np.zeros((n_win, 5), dtype=np.float64)
+
+    rng = np.random.default_rng([config.seed, int(zarr_idx), int(pool_row)])
+    found = 0
+    for _ in range(config.max_crop_attempts * n_win):
+        if found >= n_win:
+            break
+        top = int(rng.integers(0, h - crop_h + 1))
+        left = int(rng.integers(0, w - crop_w + 1))
+        seq_c, mask_c = crop_export_sequence(
+            seq_full, mask_full, top=top, left=left, crop_h=crop_h, crop_w=crop_w
+        )
+        if float(mask_c.mean()) >= float(config.max_mask_frac):
+            continue
+        sims[found] = seq_c
+        masks[found] = mask_c
+        windows[found] = [top, left, crop_h, crop_w, 0.0]
+        found += 1
+
+    if found < n_win:
+        raise RuntimeError(
+            f"Only {found}/{n_win} valid crops for zarr idx {zarr_idx} pool_row {pool_row}"
+        )
+    return sims, masks, windows
+
+
+def _export_window_pool_for_k(
+    dataset,
+    config: RandomWindowExportConfig,
+    *,
+    train_crops_per_anchor: int,
+) -> dict[str, Any]:
+    indices, _, _, _ = _pool_rows_for_train_crops(
+        config.output_prefix, train_crops_per_anchor
+    )
+    n_pool = len(indices)
+    n_win = int(config.n_windows_per_sample)
+    sims_path, mask_path, win_path = _pool_paths(config.output_prefix, train_crops_per_anchor)
+
+    sample = _sample_window_pool_for_row(dataset, int(indices[0]), 0, config)
+    total_steps, n_ch, crop_h, crop_w = (
+        sample[0].shape[1],
+        sample[0].shape[2],
+        sample[0].shape[3],
+        sample[0].shape[4],
+    )
+    sims_out = np.lib.format.open_memmap(
+        sims_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(n_pool, n_win, total_steps, n_ch, crop_h, crop_w),
+    )
+    mask_out = np.lib.format.open_memmap(
+        mask_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(n_pool, n_win, crop_h, crop_w),
+    )
+    win_out = np.lib.format.open_memmap(
+        win_path,
+        mode="w+",
+        dtype=np.float64,
+        shape=(n_pool, n_win, 5),
+    )
+
+    def _one(pool_row: int) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+        zidx = int(indices[pool_row])
+        return pool_row, *_sample_window_pool_for_row(dataset, zidx, pool_row, config)
+
+    print(
+        f"  k={train_crops_per_anchor}: {n_pool} pool rows × {n_win} windows "
+        f"(1 Zarr read per row)",
+        flush=True,
+    )
+    for pool_row, sims, masks, windows in Parallel(n_jobs=config.n_jobs, verbose=5)(
+        delayed(_one)(i) for i in range(n_pool)
+    ):
+        sims_out[pool_row] = sims
+        mask_out[pool_row] = masks
+        win_out[pool_row] = windows
+
+    sims_out.flush()
+    mask_out.flush()
+    win_out.flush()
+    del sims_out, mask_out, win_out
+
+    return {
+        "sims_path": str(sims_path),
+        "mask_path": str(mask_path),
+        "windows_path": str(win_path),
+        "shape_sims": [n_pool, n_win, total_steps, n_ch, crop_h, crop_w],
+        "train_crops_per_anchor": int(train_crops_per_anchor),
+        "n_pool": int(n_pool),
+        "n_windows_per_sample": int(n_win),
+    }
+
+
+def export_window_pools(config: RandomWindowExportConfig) -> None:
+    """Write ``_sims_pool_k{n}.npy`` with 12 cached crops per row (train: no Zarr)."""
+    prefix = Path(config.output_prefix)
+    if not Path(f"{prefix}_indices.npy").exists():
+        print("Skipping window-pool export: pool indices not found", flush=True)
+        return
+
+    meta_path = Path(f"{config.output_prefix}_window_pool_meta.json")
+    print(
+        f"Exporting window pools ({config.n_windows_per_sample} windows/row, "
+        f"cached sims) ...",
+        flush=True,
+    )
+    dataset = _build_dataset(config)
+    k_values = tuple(int(k) for k in config.train_crops_for_window_pool)
+    entries = []
+    for k in k_values:
+        print(f"Window pool for train_crops_per_anchor={k}:", flush=True)
+        entries.append(_export_window_pool_for_k(dataset, config, train_crops_per_anchor=k))
+
+    meta = {
+        "window_mode": config.window_mode,
+        "catalog_id": config.catalog_id,
+        "n_windows_per_sample": int(config.n_windows_per_sample),
+        "random_crop_seed": int(config.random_crop_seed),
+        "max_mask_frac": float(config.max_mask_frac),
+        "train_slot_rng": "[random_crop_seed, epoch, train_idx] -> slot in 0..N-1",
+        "train_slots_per_epoch": int(config.train_slots_per_epoch),
+        "train_slots_note": (
+            "train_slots_per_epoch = k spatial windows per snapshot per epoch; "
+            "training rows = n_snapshots * k (each window is one batch item)"
+        ),
+        "eval_all_windows_val_test": True,
+        "eval_note": "val/test: all 12 catalog slots per snapshot (no random); train picks slots_per_epoch",
+        "variants": entries,
+    }
+    if config.window_mode == "catalog":
+        from Magic_window.window_catalog import catalog_manifest, get_resolved_catalog
+
+        meta["catalog"] = catalog_manifest(get_resolved_catalog(config.catalog_id))
+    meta_path.write_text(json.dumps(meta, indent=2))
+    print(f"Saved window-pool metadata: {meta_path}", flush=True)
+
+
+def _maybe_export_window_pools(config: RandomWindowExportConfig) -> None:
+    if not config.export_window_pool:
+        return
+    k_values = tuple(int(k) for k in config.train_crops_for_window_pool)
+    missing = any(not _pool_paths(config.output_prefix, k)[0].exists() for k in k_values)
+    if missing:
+        export_window_pools(config)
