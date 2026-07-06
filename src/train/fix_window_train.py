@@ -38,6 +38,7 @@ class TrainConfig:
     weight_decay: float = 0.0  # L2 penalty (e.g. 1e-4); use with AdamW for decoupled decay
     optimizer: str = "adam"  # "adam" | "adamw"
     iD: int = 3
+    conditioning_steps: int = 3
     channel_indices: tuple[int, ...] | None = None  # export indices for model input
     target_channel_indices: tuple[int, ...] | None = None  # export indices to predict; None = same as input
     device: str = "cuda:7"
@@ -199,7 +200,7 @@ class SimulationDataset(Dataset):
         self.iD_in = len(ch_in)
         n_frames = int(data.shape[1])
 
-        if n_frames <= 4:
+        if n_frames < 7:
             cond_idx = list(range(n_frames - 1))
             anchor_idx = n_frames - 2
             forecast_idx = n_frames - 1
@@ -235,7 +236,7 @@ class SimulationDataset(Dataset):
 
         self.mask = mask
 
-        if n_frames <= 4:
+        if n_frames < 7:
             stat_frames = list(range(n_frames - 1))
         else:
             stat_frames = [0, 1, 2, 3]
@@ -542,8 +543,9 @@ def build_optimizer(
 
 
 def build_model(crop_h: int, crop_w: int, config: TrainConfig) -> Unet2D:
+    lb = int(getattr(config, "conditioning_steps", 3))
     par = {
-        "lb": 3,
+        "lb": lb,
         "nf": config.iD,
         "nx": crop_h,
         "ny": crop_w,
@@ -818,7 +820,7 @@ def train(
                 h_batch.to(device),
             )
             optimizer.zero_grad()
-            pred = model(x[:, -3 * config.iD :], d + h_batch / 365.0)
+            pred = model(x[:, -config.conditioning_steps * config.iD :], d + h_batch / 365.0)
             loss = myLoss(pred, y[:, : config.iD], m, spatial_weight)
             loss.backward()
             optimizer.step()
@@ -836,7 +838,7 @@ def train(
                     d.to(device),
                     h_batch.to(device),
                 )
-                pred1 = model(x[:, -3 * config.iD :], d + h_batch / 365.0)
+                pred1 = model(x[:, -config.conditioning_steps * config.iD :], d + h_batch / 365.0)
                 val_loss1 += myLoss(pred1, y[:, : config.iD], m, spatial_weight).item() * x.size(0)
 
         val_loss1 /= val_size

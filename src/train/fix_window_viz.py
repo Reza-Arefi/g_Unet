@@ -1183,6 +1183,7 @@ def save_gaussian_circles_validation_figures(
     inner_circle_radii: tuple[float, ...] | None = DEFAULT_INNER_CIRCLE_RADII,
     inner_circle_radius: float | None = None,
     residual_metric: str = "l1",
+    conditioning_steps: int = 3,
     dpi: int = 150,
     fig_scale: float = 2.0,
     layout: str = "flat_samples",
@@ -1228,7 +1229,9 @@ def save_gaussian_circles_validation_figures(
             x_b = x.unsqueeze(0).to(device)
             d_b = d.unsqueeze(0).to(device)
             h_b = h.unsqueeze(0).to(device)
-            pred = model(x_b[:, -3 * in_ch :], d_b + h_b / 365.0)[0, :iD].cpu()
+            pred = model(
+                x_b[:, -conditioning_steps * in_ch :], d_b + h_b / 365.0
+            )[0, :iD].cpu()
             target = y[:iD]
             mask = m
 
@@ -1342,6 +1345,7 @@ def compute_viz_sample_circle_l1(
     *,
     iD_in: int | None = None,
     channel_names: tuple[str, ...] = ("u", "v"),
+    conditioning_steps: int = 3,
 ) -> dict[float, dict[str, float]]:
     """Mean circle L1 per channel on fixed viz val samples (cols 4–5 metrics)."""
     radii = tuple(float(r) for r in inner_circle_radii if r > 0)
@@ -1358,7 +1362,8 @@ def compute_viz_sample_circle_l1(
     with torch.no_grad():
         for ds_idx in sample_indices:
             pred, target, mask = forward_fix_window_sample(
-                model, dataset, ds_idx, device, iD=iD, iD_in=iD_in,
+                model, dataset, ds_idx, device,
+                iD=iD, iD_in=iD_in, conditioning_steps=conditioning_steps,
             )
             if iD >= 2:
                 pred_plot, plot_ch = _uv_with_speed(pred)
@@ -1773,6 +1778,7 @@ def forward_fix_window_sample(
     *,
     iD: int = 2,
     iD_in: int | None = None,
+    conditioning_steps: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run +1d increment forward pass for one validation sample."""
     in_ch = iD if iD_in is None else iD_in
@@ -1782,7 +1788,9 @@ def forward_fix_window_sample(
         x_b = x.unsqueeze(0).to(device)
         d_b = d.unsqueeze(0).to(device)
         h_b = h.unsqueeze(0).to(device)
-        pred = model(x_b[:, -3 * in_ch :], d_b + h_b / 365.0)[0, :iD].cpu()
+        pred = model(
+            x_b[:, -conditioning_steps * in_ch :], d_b + h_b / 365.0
+        )[0, :iD].cpu()
     return pred, y[:iD], m
 
 
@@ -1838,6 +1846,7 @@ def save_fix_window_validation_figures(
     channel_names: tuple[str, ...] = DEFAULT_CHANNELS,
     loss_metric: str = "components",
     epoch_losses: dict[str, float] | None = None,
+    conditioning_steps: int = 3,
     dpi: int = 120,
     layout: str = "epoch_dirs",
     pred_cache_dir: Path | str | None = None,
@@ -1890,7 +1899,9 @@ def save_fix_window_validation_figures(
             x_b = x.unsqueeze(0).to(device)
             d_b = d.unsqueeze(0).to(device)
             h_b = h.unsqueeze(0).to(device)
-            pred = model(x_b[:, -3 * in_ch :], d_b + h_b / 365.0)[0, :iD].cpu()
+            pred = model(
+                x_b[:, -conditioning_steps * in_ch :], d_b + h_b / 365.0
+            )[0, :iD].cpu()
             target = y[:iD]
             mask = m
 

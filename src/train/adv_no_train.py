@@ -298,8 +298,8 @@ def _save_adv_resume_checkpoint(
     )
 
 
-def _forward_batch(model, x, d, h_batch, iD: int):
-    return model(x[:, -3 * iD :], d + h_batch / 365.0)
+def _forward_batch(model, x, d, h_batch, iD: int, conditioning_steps: int = 3):
+    return model(x[:, -conditioning_steps * iD :], d + h_batch / 365.0)
 
 
 def train_adv_no(
@@ -659,7 +659,7 @@ def train_adv_no(
                 target = y[:, : config.iD]
 
                 optimizer_g.zero_grad()
-                pred = _forward_batch(model, x, d, h_batch, config.iD)
+                pred = _forward_batch(model, x, d, h_batch, config.iD, config.conditioning_steps)
 
                 if not use_perc:
                     loss = reconstruction_loss(
@@ -685,7 +685,7 @@ def train_adv_no(
                     if use_adv:
                         optimizer_d.zero_grad()
                         with torch.no_grad():
-                            pred_d = _forward_batch(model, x, d, h_batch, config.iD)
+                            pred_d = _forward_batch(model, x, d, h_batch, config.iD, config.conditioning_steps)
                         d_loss = adv_loss_fn.discriminator_loss(
                             pred_d, target, m, discriminator, spatial_weight=loss_spatial_weight
                         )
@@ -719,7 +719,7 @@ def train_adv_no(
                         d.to(device),
                         h_batch.to(device),
                     )
-                    pred = _forward_batch(model, x, d, h_batch, config.iD)
+                    pred = _forward_batch(model, x, d, h_batch, config.iD, config.conditioning_steps)
                     target = y[:, : config.iD]
                     metrics = adv_loss_fn.validation_metrics(
                         pred,
@@ -773,6 +773,7 @@ def train_adv_no(
                     config.iD,
                     tuple(config.viz_gaussian_inner_circle_radii),
                     channel_names=config.channel_names,
+                    conditioning_steps=config.conditioning_steps,
                 )
                 for radius, ch_metrics in circle_metrics.items():
                     for ch, val in ch_metrics.items():
@@ -903,6 +904,7 @@ def train_adv_no(
                         inner_circle_radii=config.viz_gaussian_inner_circle_radii,
                         fig_scale=config.viz_gaussian_fig_scale,
                         residual_metric=config.viz_residual_metric,
+                        conditioning_steps=config.conditioning_steps,
                         layout="flat_samples",
                         pred_cache_dir=pred_cache_dir,
                     )
@@ -919,6 +921,7 @@ def train_adv_no(
                         channel_names=config.channel_names,
                         loss_metric=config.loss_metric,
                         epoch_losses=epoch_losses,
+                        conditioning_steps=config.conditioning_steps,
                         layout="flat_samples",
                         pred_cache_dir=pred_cache_dir,
                     )
