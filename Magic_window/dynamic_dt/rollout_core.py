@@ -327,6 +327,12 @@ def evaluate_rollout(
     sample_plots: list[str] = []
     if plot_indices:
         samples_dir = output_dir / "samples"
+        # Avoid confusing leftovers when re-running rollouts with a different
+        # `plot_indices` strategy.
+        if samples_dir.exists():
+            for child in samples_dir.iterdir():
+                if child.is_file():
+                    child.unlink()
         sample_plots = save_rollout_sample_plots(
             s_m2, s_m1, s_t, s_h1, s_h2, s_h3, p1, p2, p3,
             test_data,

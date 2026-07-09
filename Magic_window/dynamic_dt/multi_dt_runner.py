@@ -7,7 +7,13 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from dynamic_dt.device_plan import ALL_DT_DAYS, device_id_for_dt, format_dt_device_plan
+from dynamic_dt.device_plan import (
+    ALL_DT_DAYS,
+    STANDARD_DT_DAYS,
+    active_device_plan,
+    device_id_for_dt,
+    format_dt_device_plan,
+)
 from dynamic_dt.dt_config import dt_hours
 from dynamic_dt.export_runner import export_one_window
 from dynamic_dt.window_catalog import primary_export_component
@@ -20,9 +26,12 @@ from dynamic_dt.train_runner import train_one_dt
 
 
 def _resolve_dt_list(dt_days_list: Sequence[int] | None) -> list[int]:
-    if dt_days_list is None:
-        return list(ALL_DT_DAYS)
-    return list(dt_days_list)
+    if dt_days_list is not None:
+        return list(dt_days_list)
+    plan = active_device_plan()
+    if plan is not None:
+        return sorted(plan)
+    return list(STANDARD_DT_DAYS)
 
 
 def is_dt_export_complete(

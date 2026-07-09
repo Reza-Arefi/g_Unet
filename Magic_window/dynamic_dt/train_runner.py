@@ -182,6 +182,6 @@ def train_one_dt(
     os.environ["CUDA_VISIBLE_DEVICES"] = device_id
     config = AdvNOTrainConfig.from_dict(json.loads(config_path.read_text()))
     config.device = "cuda:0"
-    run_adv_no_training(config)
+    run_adv_no_training(config, resume=resume)
     job["log_path"] = str(log_path)
     return job

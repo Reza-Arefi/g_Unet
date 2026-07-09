@@ -27,7 +27,7 @@ from src.train.adv_no_train import AdvNOTrainConfig, run_adv_no_training  # noqa
 def cmd_train(args: argparse.Namespace) -> int:
     config = AdvNOTrainConfig.from_dict(json.loads(Path(args.config).read_text()))
     config.device = "cuda:0"
-    run_adv_no_training(config)
+    run_adv_no_training(config, resume=args.resume)
     return 0
 
 
@@ -69,6 +69,11 @@ def cmd_rollout(args: argparse.Namespace) -> int:
         channel_names=channel_names,
     )
     save_rollout_results(test_rollout_path, results)
+    from dynamic_dt.rollout_metrics_plots import plot_rollout_metrics_from_results
+
+    results["_run_dir"] = str(test_rollout_path)
+    results["run_name"] = run_name_value
+    plot_rollout_metrics_from_results(results, out_dir=test_rollout_path)
     update_comparison_index(
         models_dir,
         run_name_value=run_name_value,

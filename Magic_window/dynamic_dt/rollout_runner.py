@@ -117,6 +117,11 @@ def rollout_one_dt(
         channel_names=channel_names,
     )
     save_rollout_results(test_rollout_path, results)
+    from dynamic_dt.rollout_metrics_plots import plot_rollout_metrics_from_results
+
+    results["run_name"] = run_name_value
+    results["_run_dir"] = str(test_rollout_path)
+    plot_rollout_metrics_from_results(results, out_dir=test_rollout_path)
     update_comparison_index(
         models_dir,
         run_name_value=run_name_value,
